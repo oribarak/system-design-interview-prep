@@ -187,7 +187,39 @@ At 1,000 nodes pulling 500 GB each:
 
 The cluster's internal network has 100-400 Gbps per node. That's 10-40x more bandwidth than S3 can provide to a single node. We should use it.
 
-### Tree-based distribution
+### Three distribution strategies compared
+
+Before diving into our chosen approach, let's compare three distribution strategies. Assume 500 GB model, 10 Gbps shared external bandwidth (conservative), 100 Gbps internal bandwidth per worker, and 100 workers.
+
+**Key math**: External bandwidth is fixed at 10 Gbps. Downloading the first copy always takes 500 GB x 8 / 10 Gbps = 400 seconds (~6.7 min). The distribution strategy only affects what happens after that first copy arrives.
+
+| Strategy | How it works | Time for 100 workers | Time for 1,000 workers |
+|----------|-------------|---------------------|----------------------|
+| **Sequential (naive)** | Every worker downloads from external storage independently. 10 Gbps / 100 = 0.1 Gbps each. | 500 GB / 0.0125 GB/s = **~11 hours** | Even worse — bandwidth per worker shrinks further |
+| **Binary Tree** | Root downloads, distributes in tree pattern. Pipelined with chunks. Depth = log2(N). | ~13.5 min (with chunk pipelining, depth 7) | ~15 min (depth 10) |
+| **Pipeline (chain)** | W1 downloads from external, immediately forwards to W2 in a chain: W1->W2->W3->...->W100. Full-duplex: each worker receives AND forwards simultaneously. | 400s download + 4s x 99 workers / 100 = **~8 min (479s)** | 400s + 4s x 999 / 100 = **~20 min (1,199s)** |
+
+**Pipeline strategy explained**: The chain approach is surprisingly effective for ~100 workers:
+- Worker 1 downloads the model from external storage in 400 seconds (10 Gbps).
+- As each chunk arrives, W1 immediately forwards it to W2 over the internal network.
+- W2 forwards to W3 while still receiving from W1 (full-duplex networking).
+- Propagation delay per worker: 500 GB / (100 Gbps / 8) = 500 / 12.5 = 40s, but with pipelining across 1 GB chunks, each chunk takes 0.08s to forward. The propagation tail for 99 hops is 99 x 0.08s = 7.9s.
+- **Total: 400s (download) + 7.9s (propagation to last worker) = ~408s (~6.8 min)**.
+- At 1,000 workers: 400s + 999 x 0.08s = 400 + 79.9 = ~480s (~8 min).
+- At 10,000 workers: 400s + 9,999 x 0.08s = 400 + 800 = ~1,200s (~20 min). Propagation starts to dominate.
+
+**Recommendation**:
+- For ~100 workers: Pipeline is simplest and near-optimal.
+- For ~1,000 workers: Tree or pipeline both work well. Tree has lower propagation tail.
+- For 10,000+ workers: Use a **tree-of-pipelines hybrid** — each branch of the tree is a pipeline chain. Or use our chosen approach below (high fan-out tree with chunk pipelining).
+
+**Rack-aware pipeline ordering**: When using a pipeline, order workers by rack to minimize cross-rack network hops:
+- Naive ordering: W1(Rack1) -> W4(Rack2) -> W2(Rack1) -> W5(Rack2) = 3 cross-rack hops in 4 transfers
+- Rack-aware ordering: W1(R1) -> W2(R1) -> W3(R1) -> W4(R2) -> W5(R2) = 1 cross-rack hop in 4 transfers
+
+This same principle applies to tree-based distribution — build sub-trees within racks first.
+
+### Tree-based distribution (our chosen approach for large clusters)
 
 Build a logical tree over the cluster nodes:
 ```
@@ -246,8 +278,12 @@ A tree structure has a weakness: if an interior node fails, all its descendants 
 - If the primary parent fails (detected via heartbeat in 5s), the node switches to its secondary parent.
 - The Coordinator reassigns orphaned subtrees to other healthy nodes that already have the chunks.
 
-**Chunk-level retry:**
+**Pipeline failure handling (if using pipeline/chain strategy):**
+- Worker failure mid-pipeline: Skip the failed worker and reconnect its predecessor to its successor. E.g., if W5 fails in W4->W5->W6, reconnect as W4->W6. The coordinator detects failure via heartbeat and issues the reconnection.
+
+**Chunk-level retry with exponential backoff:**
 - If a chunk transfer fails (corruption, timeout), retry from the same parent or an alternate source.
+- Retry policy: exponential backoff with max 3 attempts (e.g., wait 1s, 2s, 4s between retries).
 - Any node that has a chunk can serve it — not just the tree parent. This gives BitTorrent-like resilience.
 
 ### Bandwidth governance
@@ -372,6 +408,21 @@ Before shifting traffic to a node running the new model:
 
 ## 10) Scaling: 10x and 100x (3-5 min)
 
+### Pipeline scaling analysis (when propagation dominates)
+
+With a pipeline strategy (10 Gbps external, 100 Gbps internal, 1 GB chunks at 0.08s propagation per hop):
+
+| Workers | Download Time | Propagation Tail | Total | Notes |
+|---------|--------------|-------------------|-------|-------|
+| 100 | 400s | 7.9s | **408s (6.8 min)** | Propagation negligible |
+| 1,000 | 400s | 79.9s | **480s (8 min)** | Still reasonable |
+| 10,000 | 400s | 799.9s | **1,200s (20 min)** | Propagation dominates |
+| 100,000 | 400s | 7,999s | **8,399s (140 min)** | Unacceptable — need tree-of-pipelines |
+
+At 10,000+ workers, propagation tail dominates. Solutions:
+- **Tree-of-pipelines**: Organize workers into pipeline chains of ~100, connected in a tree. Root pipeline receives from external, feeds 10 child pipelines, each feeds 10 more. Depth 2 tree of 100-worker pipelines covers 100,000 workers.
+- **Centrally coordinated mesh**: A scheduler tracks which chunks each worker has and dynamically assigns chunk transfers — worker A sends chunk 5 to worker B, while worker C sends chunk 12 to worker D. More complex to coordinate but maximizes aggregate bandwidth utilization.
+
 ### 10x (10,000 nodes)
 - Increase tree fan-out to 16. Depth stays at 3 levels (16^3 = 4,096 per sub-tree).
 - Multiple seed nodes (4-8) pulling from S3 in parallel to saturate S3 bandwidth.
@@ -387,6 +438,7 @@ Before shifting traffic to a node running the new model:
 
 ## 11) Reliability and Fault Tolerance (3-5 min)
 
+- **Coordinator failure**: The Deployment Coordinator runs as active-standby with leader election via etcd. All deployment state (which chunks are distributed to which nodes, current phase) is persisted to etcd. If the active coordinator fails, the standby acquires the etcd lease within seconds and resumes from persisted state. No deployment restart needed.
 - **Seed node failure**: Multiple seed nodes (at least 2). If one fails, others continue. S3 download is resumable with byte-range requests.
 - **Interior tree node failure**: Redundant parents. Orphaned children switch to secondary parent within 5 seconds. Coordinator reassigns the subtree.
 - **Chunk corruption**: Per-chunk SHA-256 verification. Corrupted chunks are re-transferred from any node that has a valid copy. Full-model checksum after all chunks are assembled.

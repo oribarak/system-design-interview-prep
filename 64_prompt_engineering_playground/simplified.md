@@ -12,7 +12,16 @@ Design a prompt engineering playground (like Anthropic Console or OpenAI Playgro
 
 **Non-functional:** TTFT < 1s. Editor operations < 200ms. Support 200K token context windows without UI freezing. 99.9% availability.
 
-## 3. High-Level Architecture
+## 3. Core Entities
+User, Organization, Project, Prompt, PromptVersion, Execution, ExecutionResult, SharedPrompt. Key insight: **execution is tied to a prompt** (`POST /prompts/:id/execute`, not `POST /execute`). This ensures automatic history tracking -- no orphaned runs.
+
+**Client-first thinking -- what does each screen need?**
+- Prompt list: name, current version, last execution stats
+- Prompt editor: draft_config (JSONB), version history sidebar
+- Execution history: cursor-paginated executions with results
+- Shared view: read-only PromptVersion config
+
+## 4. High-Level Architecture
 ```
 Developer --> [React SPA (Monaco Editor + Output Pane)]
                         |
@@ -30,7 +39,7 @@ Developer --> [React SPA (Monaco Editor + Output Pane)]
 - **Streaming Proxy**: Proxies SSE connections to inference API. Handles comparison multiplexing.
 - **Version Store**: Git-like immutable prompt version snapshots.
 
-## 4. Deep Dive: Token Streaming at 60fps
+## 4.5. Deep Dive: Token Streaming at 60fps
 
 Tokens arrive at ~50/second (every 20ms). Naive approach: setState per token = React re-renders 50x/second = UI jank.
 
@@ -44,7 +53,17 @@ Tokens arrive at ~50/second (every 20ms). Naive approach: setState per token = R
 
 **For code blocks:** Incremental syntax highlighting (Tree-sitter/Lezer) — only highlight new tokens, not the entire output.
 
-## 5. Deep Dive: Prompt Versioning
+## 5. API Design Highlights
+
+**Execution tied to prompt:** `POST /prompts/:id/execute` (not `POST /execute`). Every execution is a sub-resource of a prompt -- automatic history, no orphans.
+
+**Idempotency-Key header:** Client sends a UUID with each execution request. Server deduplicates on this key. Critical because model calls are expensive -- a network timeout + retry should not run the model twice.
+
+**Autosave with PATCH:** `PATCH /prompts/:id` updates draft_config without creating a version. Debounced every 5 seconds on the client. Versions are only created on explicit save (Cmd+S) or on execute.
+
+**Cursor-based pagination:** `GET /prompts/:id/executions?cursor=<opaque>&limit=20`. Cursor-based (not offset) because execution history grows while the user paginates -- offset would skip/duplicate results.
+
+## 6. Deep Dive: Prompt Versioning
 
 Each prompt has a version timeline:
 - **Auto-save**: Drafts saved to Redis every 5s (crash recovery, not a version).
@@ -55,7 +74,7 @@ Each prompt has a version timeline:
 
 **Version timeline UI:** Vertical timeline in the side panel. Click any version to load. Compare any two versions side-by-side. Fork from any historical version.
 
-## 6. Side-by-Side Comparison
+## 7. Side-by-Side Comparison
 
 User selects two model configs, clicks "Compare". Two SSE streams open in parallel:
 - Each stream renders independently in its own pane.
@@ -64,7 +83,7 @@ User selects two model configs, clicks "Compare". Two SSE streams open in parall
 
 Multiplexing: single SSE connection with stream_id tags, or two separate connections.
 
-## 7. Tool Call Handling
+## 8. Tool Call Handling
 
 When the LLM emits a `tool_use` block mid-stream:
 1. Streaming pauses.
@@ -72,17 +91,20 @@ When the LLM emits a `tool_use` block mid-stream:
 3. User provides a mock result (or auto-execute against a mock server).
 4. Result sent back, generation continues.
 
-## 8. Key Trade-offs to Mention
+## 9. Key Trade-offs to Mention
 | Decision | Trade-off |
 |----------|-----------|
 | requestAnimationFrame buffering vs. React state per token | 60fps vs. janky. Buffering bypasses React reconciliation. |
 | Full version snapshots vs. delta chains | Snapshots simpler, cheap at 5 KB each. Deltas save space but complicate reads. |
 | SSE vs. WebSocket | SSE is simpler and sufficient for unidirectional streaming. |
 | Monaco vs. textarea | Monaco handles large text, syntax highlighting, but heavier to load. |
+| POST /prompts/:id/execute vs POST /execute | Tied to prompt = automatic history tracking, no orphaned runs. Standalone = more flexible but loses context. |
+| Idempotency-Key header | Essential for expensive model calls. Network retry without duplicate GPU spend. |
+| Cursor vs offset pagination | Cursor is stable under concurrent inserts (new executions don't shift pages). |
 
-## 9. Scaling
+## 10. Scaling
 - **10x**: Stateless streaming proxies scale horizontally. Redis Cluster for drafts. CDN for the SPA.
 - **100x**: Shard prompt storage by workspace. Regional streaming proxies. Rate limiting per workspace for expensive model runs.
 
-## 10. Closing (30s)
+## 11. Closing (30s)
 > The key challenge is streaming UX: tokens arrive at 50/second and naive React rendering janks. requestAnimationFrame buffering flushes tokens to the DOM once per frame, bypassing React reconciliation. Git-like versioning stores immutable prompt snapshots with auto-versioning on every run for reproducibility. Side-by-side comparison runs parallel inference streams with synchronized rendering. The architecture is a React SPA with Monaco editor, a stateless streaming proxy for SSE, and PostgreSQL-backed versioning.

@@ -2,24 +2,25 @@
 
 ## 0) Opening: Frame the Problem (30-60s)
 
-> "We need to design a distributed rate limiter that enforces request quotas across a fleet of API servers. Rate limiting is critical for protecting services from abuse, ensuring fair usage, and preventing cascading failures. I will cover the core algorithms (token bucket, sliding window), the distributed counting mechanism using Redis, the middleware integration, and how we handle edge cases like clock drift and race conditions. The key challenge is making accurate, low-latency rate-limit decisions in a distributed environment without becoming a bottleneck itself."
+> "We need to design a rate limiter as a service — a platform that our clients integrate with to enforce request quotas on their own APIs. Rate limiting is critical for protecting services from abuse, ensuring fair usage, and preventing cascading failures. I will cover the core algorithms (token bucket, sliding window), the distributed counting mechanism using Redis, the service API, and how we handle edge cases like clock drift and race conditions. The key challenge is providing accurate, low-latency rate-limit decisions at scale while letting each client configure their own policies and failure behavior."
 
 ## 1) Clarifying Questions (2-5 min)
 
 **Scope**
-- Is this a standalone rate-limiting service or middleware embedded in API gateways?
+- This is a standalone rate-limiting service that clients (other teams/companies) integrate with via API.
 - Do we need to support multiple rate-limit dimensions (per user, per API key, per IP, per endpoint)?
 - Should we support different rate-limit policies (e.g., 100 req/min for free tier, 10,000 req/min for premium)?
+- Do clients configure their own rules, or do we define them centrally?
 
 **Scale**
-- How many API servers will query the rate limiter? Assume 1,000 application servers.
-- What is the peak request rate? Assume 1 million requests/sec across all servers.
+- How many client services will query the rate limiter? Assume 1,000+ client applications.
+- What is the peak request rate? Assume 1 million requests/sec across all clients.
 - What latency overhead is acceptable? Assume < 1 ms per rate-limit check.
 
 **Policy / Constraints**
 - Is it acceptable to occasionally allow a small burst over the limit (soft limit), or must it be strict?
-- How should rate-limit state behave during network partitions — fail open (allow) or fail closed (deny)?
-- Do we need real-time rate-limit headers in responses (X-RateLimit-Remaining, X-RateLimit-Reset)?
+- Should clients choose their own failure behavior (fail open vs. fail closed) when our service is unreachable?
+- Do we return rate-limit metadata so clients can include headers in their own responses (X-RateLimit-Remaining, X-RateLimit-Reset)?
 
 ## 2) Back-of-Envelope Estimation (3-5 min)
 
@@ -39,36 +40,49 @@
 ## 3) Requirements (3-5 min)
 
 ### Functional
-- Evaluate whether a request should be allowed or denied based on configurable rate-limit rules.
+- Provide an API for clients to check whether a request should be allowed or denied based on their configured rate-limit rules.
 - Support multiple dimensions: per-user, per-API-key, per-IP, per-endpoint, or combinations.
 - Support configurable windows: per-second, per-minute, per-hour, per-day.
-- Return rate-limit metadata in response headers (limit, remaining, reset time).
-- Allow dynamic rule updates without restarting services.
+- Return rate-limit metadata (limit, remaining, reset time) so clients can include it in their own responses.
+- Allow clients to dynamically create, update, and delete their own rules via a management API.
+- Per-client configurable failure policy: fail open or fail closed when our service is unreachable.
 
 ### Non-functional
-- Latency: rate-limit check must add < 1 ms to request processing (p99).
-- Throughput: handle 1 million rate-limit evaluations per second.
+- Latency: rate-limit check must respond in < 1 ms (p99).
+- Throughput: handle 1 million rate-limit evaluations per second across all clients.
 - Accuracy: over-counting error < 1% (no significant over- or under-counting).
-- Availability: the rate limiter must not become a single point of failure; fail-open on limiter unavailability.
-- Consistency: in a distributed setting, enforce limits with at most a small burst tolerance (e.g., 5% overshoot across servers).
+- Availability: the rate limiter service must be highly available; clients choose their own failure behavior (fail open or fail closed) via configuration.
+- Consistency: in a distributed setting, enforce limits with at most a small burst tolerance (e.g., 5% overshoot).
+- Multi-tenancy: isolate client configurations and counters; one client's load must not affect another's latency.
 
 ## 4) API Design (2-4 min)
 
+All endpoints are scoped to the calling client via their API key / tenant ID.
+
 ```
-POST /ratelimit/check
+POST /v1/check
+  Headers: Authorization: Bearer <client_api_key>
   Body: {key: "user:12345", endpoint: "/api/orders", weight: 1}
   Returns: {allowed: true, limit: 100, remaining: 73, reset_at: 1700000060}
   (Or: {allowed: false, limit: 100, remaining: 0, reset_at: 1700000060, retry_after: 12})
 
-GET /ratelimit/status?key=user:12345
+GET /v1/status?key=user:12345
+  Headers: Authorization: Bearer <client_api_key>
   Returns: {key: "user:12345", rules: [{window: "1m", limit: 100, current: 27}, {window: "1d", limit: 10000, current: 4521}]}
 
-PUT /ratelimit/rules
+PUT /v1/rules
+  Headers: Authorization: Bearer <client_api_key>
   Body: {rule_id: "free_tier_api", key_pattern: "user:*", endpoint: "/api/*", limits: [{window: "1m", max: 100}, {window: "1d", max: 10000}]}
   Returns: 200 OK
 
-DELETE /ratelimit/rules/{rule_id}
+DELETE /v1/rules/{rule_id}
+  Headers: Authorization: Bearer <client_api_key>
   Returns: 204 No Content
+
+PUT /v1/config
+  Headers: Authorization: Bearer <client_api_key>
+  Body: {on_service_failure: "deny"}  // or "allow" — client chooses their own failure policy
+  Returns: 200 OK
 ```
 
 ## 5) Data Model (3-5 min)
@@ -98,22 +112,21 @@ Key: rl:log:{key}
 Value: sorted set of timestamps
 ```
 
-**Storage choice**: Redis for counters — in-memory, sub-millisecond latency, atomic operations, built-in TTL. Rules stored in a persistent config store (etcd or Postgres) and cached locally on each API server.
+**Storage choice**: Redis for counters — in-memory, sub-millisecond latency, atomic operations, built-in TTL. Rules and client configurations stored in a persistent config store (etcd or Postgres) and cached locally on each rate limiter service node. All keys are namespaced per client/tenant for isolation.
 
 ## 6) High-Level Architecture (5-8 min)
 
-**Dataflow**: When a request arrives at an API server, the rate-limit middleware extracts the key (user ID, API key, IP), consults cached rules to determine the applicable limits, performs an atomic increment-and-check against Redis, and either allows the request to proceed or returns HTTP 429. Rate-limit headers are added to every response.
+**Dataflow**: A client service calls our rate limiter API (POST /v1/check) with a rate-limit key (e.g., user ID, API key). Our service looks up the client's rules, performs an atomic increment-and-check against Redis, and returns an allow/deny decision with metadata (remaining, reset time). The client uses this response to decide whether to serve or reject their end-user's request.
 
 **Components**:
-- **API Gateway / Middleware**: Intercepts every request, extracts rate-limit key, calls the limiter logic.
-- **Rate Limit Evaluator**: Local library/sidecar that implements the algorithm (token bucket or sliding window) and communicates with Redis.
-- **Redis Cluster**: Centralized counter store. Sharded by rate-limit key for horizontal scaling.
-- **Rules Config Store**: etcd or Postgres holding rate-limit policies. Changes are watched and propagated to all servers.
-- **Local Rule Cache**: Each API server caches rules in memory, refreshed every few seconds or via watch.
-- **Rate Limit Dashboard**: Admin UI for viewing current usage, updating rules, and monitoring enforcement.
-- **Async Sync Layer** (optional): For local token buckets with periodic sync to reduce Redis round-trips.
+- **Rate Limiter API Service**: Stateless service nodes behind a load balancer. Receives check requests from clients, evaluates rules, queries Redis.
+- **Redis Cluster**: Centralized counter store. Sharded by rate-limit key for horizontal scaling. Keys namespaced per client/tenant.
+- **Rules Config Store**: etcd or Postgres holding per-client rate-limit policies. Changes are watched and propagated to all service nodes.
+- **Local Rule Cache**: Each service node caches client rules in memory, refreshed every few seconds or via watch.
+- **Client Management Dashboard**: Admin UI/API for clients to manage their rules, view usage, and configure failure policies.
+- **SDK / Client Library** (optional): Thin wrapper clients can embed for convenience. Handles calling our API, caching decisions briefly, and applying their configured failure policy locally if our service is unreachable.
 
-**One-sentence summary**: A distributed rate limiter where each API server evaluates requests against cached rules using atomic Redis operations for shared counters, with configurable algorithms (token bucket, sliding window) and fail-open semantics.
+**One-sentence summary**: A multi-tenant rate limiter service where clients call our API to get allow/deny decisions backed by atomic Redis operations, with per-client configurable algorithms, rules, and failure policies (fail open or fail closed).
 
 ## 7) Deep Dive #1: Rate-Limiting Algorithms (8-12 min)
 
@@ -185,13 +198,13 @@ With 1,000 API servers all hitting Redis, two servers might read the same counte
 
 **Solution**: Use Redis Lua scripts. Redis executes Lua scripts atomically — no other command runs between the GET and INCR. This eliminates read-modify-write races entirely.
 
-### Reducing Redis Round-Trips: Local Batching
+### Reducing Redis Round-Trips: Internal Optimizations
 
-For very high throughput, every request hitting Redis adds ~0.5 ms of network latency. Alternative approaches:
+For very high throughput, every request hitting Redis adds ~0.5 ms of network latency. Internal optimizations within our service:
 
-1. **Local token bucket with sync**: Each server maintains a local token bucket pre-loaded with tokens/N_servers. Periodically (every 1-5 seconds), sync with Redis to reclaim unused tokens or release excess. Accuracy degrades during sync intervals but latency drops to near-zero.
+1. **Local token bucket with sync**: Each service node maintains a local token bucket pre-loaded with tokens/N_nodes. Periodically (every 1-5 seconds), sync with Redis to reclaim unused tokens or release excess. Accuracy degrades during sync intervals but latency drops to near-zero.
 
-2. **Request coalescing**: Batch multiple rate-limit checks into a single Redis pipeline. If 100 requests arrive in a 1 ms window, pipeline them into one network round-trip.
+2. **Request coalescing**: Batch multiple rate-limit checks from different clients into a single Redis pipeline. If 100 check requests arrive in a 1 ms window, pipeline them into one network round-trip.
 
 ### Clock Drift
 
@@ -201,10 +214,12 @@ Different servers may have slightly different clocks, causing inconsistent windo
 
 ### Network Partition Behavior
 
-If Redis is unreachable:
-- **Fail open**: allow the request but log the limiter failure. Risk: temporary over-limit traffic.
-- **Fail closed**: deny the request. Risk: false rejections for legitimate users.
-- **Recommended**: fail open with a local fallback limiter using conservative limits (e.g., 50% of the normal rate) based on a local in-memory counter.
+If Redis is unreachable internally:
+- Our service nodes use local fallback counters with conservative limits to continue serving decisions.
+- The decision of whether to **fail open or fail closed** is configured per client (via `PUT /v1/config`). Each client knows their own risk tolerance:
+  - **Fail open (allow)**: Client's end-users are not blocked, but rate limits are temporarily unenforced. Suitable for non-critical APIs.
+  - **Fail closed (deny)**: Client's end-users are blocked, but protection is maintained. Suitable for payment or security-sensitive APIs.
+- If our service itself is unreachable, the client SDK applies the client's configured failure policy locally.
 
 ## 9) Trade-offs and Alternatives (3-5 min)
 
@@ -216,15 +231,15 @@ If Redis is unreachable:
 - Exact counting (sliding window log) is expensive at high limits.
 - Approximate methods (sliding window counter, token bucket) are practical and accurate within 1-5%.
 
-### Client-side vs. Server-side
-- Server-side (our design): authoritative, cannot be bypassed.
-- Client-side: useful for reducing unnecessary requests but cannot enforce limits.
+### Our service vs. client-side only
+- Our service: authoritative, centralized state, consistent enforcement across all of a client's servers.
+- Client-side only: no network hop, but each client must build and maintain their own solution, and counters are not shared across their server fleet.
 
-### Dedicated Service vs. Embedded Library
-- Dedicated service: uniform enforcement, centralized management, but extra hop.
-- Embedded library: lower latency, no extra service to operate, but harder to update rules uniformly.
+### Service call vs. SDK with local cache
+- Direct API call: always accurate, but adds a network hop per request.
+- SDK with local cache: the SDK can briefly cache decisions and apply the client's failure policy locally, reducing latency and providing resilience if our service is temporarily unreachable.
 
-Our design: embedded library that talks to shared Redis, combining low latency with centralized state.
+Our design: a hosted service with an optional thin SDK that clients can embed for convenience and resilience.
 
 ## 10) Scaling: 10x and 100x (3-5 min)
 
@@ -242,10 +257,12 @@ Our design: embedded library that talks to shared Redis, combining low latency w
 ## 11) Reliability and Fault Tolerance (3-5 min)
 
 - **Redis HA**: Redis Sentinel or Redis Cluster with automatic failover. Replication factor of 2 (primary + replica). Failover time: 5-15 seconds.
-- **Fail-open policy**: if Redis is unreachable, allow traffic with local fallback limiter. Set an alert and investigate.
-- **Rule cache durability**: rate-limit rules are cached locally. Even if the config store is down, servers continue enforcing the last-known rules.
+- **Service unavailability**: if our service is unreachable, the client SDK applies the client's configured failure policy (fail open or fail closed) locally. This ensures each client controls their own risk.
+- **Internal Redis failure**: our service nodes fall back to local conservative counters and continue serving decisions. Clients are notified of degraded accuracy via response metadata.
+- **Rule cache durability**: rate-limit rules are cached locally on service nodes. Even if the config store is down, nodes continue enforcing the last-known rules.
 - **Graceful degradation**: under extreme load, switch from per-request Redis checks to local-only rate limiting with periodic sync. Trade accuracy for availability.
 - **Multi-region**: each region has its own Redis cluster. For global rate limits (e.g., daily API quota), use async aggregation with eventual consistency.
+- **Tenant isolation**: per-client rate limiting on our own API prevents one noisy client from degrading service for others.
 
 ## 12) Observability and Operations (2-4 min)
 
@@ -256,16 +273,18 @@ Our design: embedded library that talks to shared Redis, combining low latency w
 
 ## 13) Security (1-3 min)
 
-- **Key spoofing prevention**: rate-limit keys derived from authenticated identity (JWT claims, API key), not client-provided headers.
-- **IP-based limiting**: applied at the edge (CDN/WAF) before authentication to block DDoS at the network layer.
-- **Rule access control**: only admin roles can modify rate-limit rules via the management API.
-- **Rate-limit headers**: include X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset in responses to help legitimate clients self-throttle.
+- **Client authentication**: all API calls to our service require a valid client API key. Keys are scoped per tenant.
+- **Tenant isolation**: each client's rules and counters are namespaced. One client cannot read or affect another's data.
+- **Rate limiting our own API**: we apply rate limits on our own service API to prevent a single client from overwhelming the platform.
+- **Rule access control**: only authenticated client admins can modify their own rate-limit rules via the management API.
+- **Response metadata**: we return rate-limit metadata (limit, remaining, reset) so clients can include X-RateLimit headers in their own responses.
 
 ## 14) Team and Operational Considerations (1-2 min)
 
-- **Ownership**: the platform/infrastructure team owns the rate-limiting service and Redis cluster. Product teams define rate-limit policies for their APIs.
-- **Rollout**: new rate-limit rules deployed via config store with gradual enforcement (shadow mode -> warn mode -> enforce mode).
-- **On-call**: page on Redis cluster failover, sustained high denial rates, or rate-limiter latency spikes.
+- **Ownership**: our platform team owns and operates the rate limiter service, Redis cluster, and client-facing APIs. Clients self-serve their own rules and policies.
+- **Onboarding**: new clients receive an API key, configure their rules via the management API or dashboard, and integrate via direct API calls or our SDK.
+- **Rollout**: clients can deploy new rules with gradual enforcement (shadow mode -> warn mode -> enforce mode).
+- **On-call**: page on Redis cluster failover, sustained high denial rates, service latency spikes, or tenant isolation breaches.
 
 ## 15) Common Follow-up Questions
 
@@ -277,14 +296,14 @@ Our design: embedded library that talks to shared Redis, combining low latency w
 
 ## 16) Closing Summary (30-60s)
 
-> "We designed a distributed rate limiter using a token bucket algorithm backed by Redis for shared state. Each API server has an embedded rate-limit evaluator that atomically checks and increments counters via Redis Lua scripts, ensuring no race conditions. Rules are stored in a config service and cached locally. The system fails open if Redis is unreachable, falling back to local conservative limits. At scale, we reduce Redis load through local token buckets with periodic sync, request pipelining, and hierarchical limiting. The design balances accuracy (< 1% error in normal operation) with low latency (< 1 ms overhead) and high availability."
+> "We designed a rate limiter as a service — a multi-tenant platform that clients call via API to get allow/deny decisions. Counters are backed by Redis with atomic Lua scripts for accuracy. Each client configures their own rules, algorithms, and failure policy (fail open or fail closed) — we don't make that decision for them since we don't know their use cases. An optional thin SDK provides resilience if our service is temporarily unreachable. At scale, we reduce Redis load through local token buckets with periodic sync, request pipelining, and hierarchical limiting. The design balances accuracy (< 1% error in normal operation) with low latency (< 1 ms) and tenant isolation."
 
 ## Appendix A: Configuration / Tuning Knobs
 
 | Knob | Default | Effect |
 |------|---------|--------|
 | `algorithm` | token_bucket | Algorithm: token_bucket, sliding_window_counter, sliding_window_log |
-| `fail_mode` | open | Behavior when Redis is unreachable: open (allow) or closed (deny) |
+| `fail_mode` | deny | Per-client behavior when service is unreachable: open (allow) or closed (deny). Client chooses. |
 | `local_sync_interval` | 5s | How often local token buckets sync with Redis |
 | `redis_timeout` | 50 ms | Redis operation timeout before falling back |
 | `rule_cache_ttl` | 30s | How long rules are cached locally before refresh |
@@ -299,7 +318,7 @@ Our design: embedded library that talks to shared Redis, combining low latency w
 | **Token Bucket** | Algorithm where tokens are added at a fixed rate and consumed per request; empty bucket means denial. |
 | **Sliding Window** | Rate-limit window that moves continuously with time, as opposed to fixed windows aligned to clock boundaries. |
 | **Lua Script** | Server-side script executed atomically by Redis, used to implement read-modify-write without races. |
-| **Fail Open** | Allowing requests when the rate limiter is unavailable, trading accuracy for availability. |
+| **Fail Open** | Allowing requests when the rate limiter is unavailable, trading enforcement for availability. Configured per client. |
 | **Backpressure** | Mechanism to slow down producers when the system is overloaded, typically via HTTP 429 + Retry-After. |
 | **Rate-Limit Key** | The identifier used for counting (user ID, API key, IP address, or a combination). |
 | **Burst** | A short spike of requests above the steady-state rate, allowed by token bucket up to bucket capacity. |

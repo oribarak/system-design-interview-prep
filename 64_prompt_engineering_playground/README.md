@@ -59,11 +59,14 @@
 ## 4) API Design
 
 ```
-POST /v1/playground/run
-Headers: Authorization: Bearer <api_key>
+// Execute a prompt — tied to the prompt resource, not a standalone endpoint.
+// This ensures every execution is automatically linked to a prompt for history tracking.
+POST /v1/prompts/{prompt_id}/execute
+Headers:
+  Authorization: Bearer <api_key>
+  Idempotency-Key: <client-generated-uuid>   // Prevents duplicate expensive model calls on retry
 Body:
 {
-  "prompt_id": "p-abc123",       // optional, links run to a saved prompt
   "model": "claude-sonnet-4-6",
   "messages": [
     { "role": "system", "content": "You are a helpful assistant..." },
@@ -87,31 +90,63 @@ Response (streaming): Server-Sent Events
   ...
   data: {"type": "message_stop", "usage": {"input_tokens": 45, "output_tokens": 312}}
 
-POST /v1/playground/compare
+// Why POST /prompts/:id/execute instead of POST /execute?
+// - Execution is inherently tied to a prompt — automatic history tracking
+// - No orphaned executions; every run is linked to a prompt and version
+// - Clean REST semantics: execution is a sub-resource of a prompt
+// - Client-first thinking: the execution history screen shows all runs for a prompt
+
+POST /v1/prompts/{prompt_id}/compare
 Body:
 {
-  "prompt_id": "p-abc123",
   "configs": [
     { "model": "claude-sonnet-4-6", "parameters": { "temperature": 0.3 } },
     { "model": "claude-opus-4-6", "parameters": { "temperature": 0.7 } }
   ],
   "messages": [ ... ]
 }
+Headers:
+  Idempotency-Key: <client-generated-uuid>
 Response: Two parallel SSE streams multiplexed with stream_id tags.
 
 POST /v1/prompts
 Body: { "name": "My Prompt", "workspace_id": "w-123", "config": { ... } }
 Response: { "prompt_id": "p-abc123", "version": 1 }
 
+// Autosave with PATCH — for constant prompt tweaking without creating new versions
+PATCH /v1/prompts/{prompt_id}
+Body: { "config": { "parameters": { "temperature": 0.5 } } }
+Response: { "prompt_id": "p-abc123", "updated_at": "..." }
+// PATCH updates the draft state without creating a version.
+// Versions are created explicitly (Cmd+S) or automatically on execute.
+
 PUT /v1/prompts/{prompt_id}
 Body: { "config": { ... }, "commit_message": "Adjusted temperature" }
 Response: { "prompt_id": "p-abc123", "version": 2 }
+
+// Execution history — cursor-based pagination for potentially long history
+GET /v1/prompts/{prompt_id}/executions?cursor=<opaque_cursor>&limit=20
+Response: {
+  "executions": [
+    { "execution_id": "e-xyz", "version": 2, "model": "claude-sonnet-4-6",
+      "input_tokens": 45, "output_tokens": 312, "latency_ms": 1200, "created_at": "..." }
+  ],
+  "next_cursor": "eyJ0IjoiMjAyNi...",
+  "has_more": true
+}
+// Cursor-based (not offset) because: stable under concurrent inserts,
+// no skipping/duplicating results when new executions are added during pagination.
 
 GET /v1/prompts/{prompt_id}/versions
 Response: { "versions": [{ "version": 2, "diff": "...", "created_at": "..." }, ...] }
 
 GET /v1/prompts/{prompt_id}/versions/{version}
 Response: { "config": { ... }, "version": 2 }
+
+// Share a prompt (creates a read-only snapshot)
+POST /v1/prompts/{prompt_id}/share
+Body: { "visibility": "workspace" | "public", "expires_at": "..." }
+Response: { "shared_prompt_id": "sp-abc", "share_url": "..." }
 ```
 
 ## 5) Data Model
@@ -120,18 +155,26 @@ Response: { "config": { ... }, "version": 2 }
 
 | Entity | Key Fields | Storage |
 |--------|-----------|---------|
-| Workspace | workspace_id, name, owner_id, members[], plan_tier | PostgreSQL |
-| Prompt | prompt_id, workspace_id, name, current_version, created_at | PostgreSQL |
-| PromptVersion | version_id, prompt_id, version_num, config (JSON), commit_message, created_by, created_at | PostgreSQL (JSONB for config) |
-| Run | run_id, prompt_id, version_id, model, input_tokens, output_tokens, latency_ms, created_at | ClickHouse (analytics) |
-| RunOutput | run_id, full_output, tool_calls[], finish_reason | S3 (large outputs) + PostgreSQL (metadata) |
-| User | user_id, email, workspace_ids[], api_key_hash | PostgreSQL |
+| User | user_id, email, api_key_hash, created_at | PostgreSQL |
+| Organization | org_id, name, owner_id, plan_tier, token_budget | PostgreSQL |
+| Project | project_id, org_id, name, description, created_at | PostgreSQL |
+| Prompt | prompt_id, project_id, name, current_version, draft_config (JSONB), created_at | PostgreSQL |
+| PromptVersion | version_id, prompt_id, version_num, config (JSONB), commit_message, created_by, created_at | PostgreSQL |
+| Execution | execution_id, prompt_id, version_id, model, input_tokens, output_tokens, latency_ms, idempotency_key, created_at | PostgreSQL (metadata) + ClickHouse (analytics) |
+| ExecutionResult | execution_id, full_output, tool_calls[], finish_reason, raw_response | S3 (large outputs) + PostgreSQL (metadata) |
+| SharedPrompt | shared_prompt_id, prompt_id, version_id, visibility, share_url, expires_at, created_by | PostgreSQL |
+
+**Key entity relationships (client-first thinking -- what data does each screen need?):**
+- **Prompt list screen**: `GET /projects/:id/prompts` -- needs Prompt.name, current_version, last execution stats
+- **Prompt editor screen**: `GET /prompts/:id` -- needs Prompt.draft_config (JSONB), version history sidebar
+- **Execution history screen**: `GET /prompts/:id/executions` -- cursor-paginated list of Execution + ExecutionResult summaries
+- **Shared prompt view**: `GET /shared/:shared_prompt_id` -- needs SharedPrompt -> PromptVersion.config (read-only)
 
 ### Storage Choices
 - **Prompt configs**: PostgreSQL with JSONB — supports complex nested structures, indexable, transactional versioning.
 - **Run outputs**: S3 for full conversation logs (can be large with 200K context), metadata in PostgreSQL.
 - **Analytics**: ClickHouse for run metrics (token usage, latency distributions, model comparison).
-- **Session state**: Redis for active editor sessions and unsaved drafts (auto-save every 5s).
+- **Session state**: Redis for active editor sessions. Auto-save uses `PATCH /prompts/:id` to persist draft_config to PostgreSQL every 5 seconds (debounced). Redis caches the latest draft for fast loads.
 
 ## 6) High-Level Architecture (5-8 min)
 
@@ -432,7 +475,9 @@ The user clicks "Run" and sees tokens appear one at a time. Here's the full path
 | Virtual scrolling | Rendering only visible rows/lines, recycling DOM nodes as user scrolls |
 | CRDT | Conflict-free Replicated Data Type — for real-time collaborative editing |
 | Prompt version | An immutable snapshot of the full prompt configuration at a point in time |
-| Run | A single execution of a prompt against a model, producing an output |
+| Idempotency-Key | Client-generated UUID sent as a header to prevent duplicate model executions on retry |
+| Cursor-based pagination | Using an opaque cursor token (not offset) for stable pagination under concurrent writes |
+| Execution (Run) | A single execution of a prompt against a model, producing an output |
 
 ## Appendix C: References
 

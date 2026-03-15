@@ -1,77 +1,67 @@
-# Rate Limiter — Architecture Diagrams
+# Rate Limiter Service — Architecture Diagrams
 
 ## 1. High-Level Architecture
 
 ```mermaid
 flowchart TB
-    subgraph Clients
-        WEB[Web Clients]
-        MOB[Mobile Clients]
-        EXT[Third-Party API Consumers]
+    subgraph ClientServices["Client Services (our customers)"]
+        C1[Client A - E-commerce API]
+        C2[Client B - SaaS Platform]
+        C3[Client C - Mobile Backend]
     end
 
-    subgraph Edge["Edge Layer"]
-        CDN[CDN / WAF - IP Rate Limiting]
-    end
-
-    subgraph Gateway["API Gateway Layer"]
+    subgraph RateLimiterService["Rate Limiter Service (what we provide)"]
         LB[Load Balancer]
-        GW1[API Server 1 + RL Middleware]
-        GW2[API Server 2 + RL Middleware]
-        GW3[API Server N + RL Middleware]
+
+        subgraph ServiceNodes["Stateless Service Nodes"]
+            N1[Service Node 1]
+            N2[Service Node 2]
+            N3[Service Node N]
+        end
+
+        subgraph RedisCluster["Redis Cluster - Counter Store"]
+            R1[Redis Shard 1]
+            R2[Redis Shard 2]
+            R3[Redis Shard 3]
+        end
+
+        subgraph Config["Configuration"]
+            ETCD[Rules Config Store - etcd]
+            DASH[Client Dashboard]
+        end
     end
 
-    subgraph RateLimiter["Rate Limit Infrastructure"]
-        EVAL[Rate Limit Evaluator Library]
-        RCACHE[Local Rule Cache]
-        LBUCKET[Local Token Bucket Fallback]
+    subgraph SDK["Optional Client SDK"]
+        CACHE[Local Decision Cache]
+        FAILPOL[Failure Policy Handler]
     end
 
-    subgraph RedisCluster["Redis Cluster - Counter Store"]
-        R1[Redis Shard 1]
-        R2[Redis Shard 2]
-        R3[Redis Shard 3]
-    end
+    C1 & C2 & C3 -->|"POST /v1/check"| LB
+    LB --> N1 & N2 & N3
+    N1 & N2 & N3 -->|"atomic incr+check"| R1 & R2 & R3
+    N1 & N2 & N3 -->|"read cached rules"| ETCD
 
-    subgraph Config["Configuration"]
-        ETCD[Rules Config Store - etcd]
-        ADMIN[Admin Dashboard]
-    end
+    C1 & C2 & C3 -->|"PUT /v1/rules"| DASH
+    DASH -->|"update rules"| ETCD
 
-    subgraph Backend["Backend Services"]
-        SVC1[Order Service]
-        SVC2[User Service]
-        SVC3[Search Service]
-    end
+    N1 & N2 & N3 -->|"allow/deny + metadata"| C1 & C2 & C3
 
-    WEB & MOB & EXT -->|"requests"| CDN
-    CDN -->|"passed requests"| LB
-    LB --> GW1 & GW2 & GW3
-
-    GW1 & GW2 & GW3 -->|"check rate limit"| EVAL
-    EVAL -->|"read rules"| RCACHE
-    EVAL -->|"atomic incr+check"| R1 & R2 & R3
-    EVAL -->|"fallback if Redis down"| LBUCKET
-
-    ETCD -->|"push rule updates"| RCACHE
-    ADMIN -->|"update rules"| ETCD
-
-    GW1 & GW2 & GW3 -->|"allowed requests"| SVC1 & SVC2 & SVC3
-    GW1 & GW2 & GW3 -->|"denied: 429 + headers"| Clients
+    C1 -.->|"optional"| SDK
+    SDK -.->|"calls service or applies\nlocal failure policy"| LB
 ```
 
 ## 2. Deep-Dive: Token Bucket Algorithm with Redis
 
 ```mermaid
 flowchart TB
-    subgraph Request["Incoming Request"]
-        REQ[Request with user_id + endpoint]
+    subgraph Request["Client Calls POST /v1/check"]
+        REQ["key=user:12345, endpoint=/api/orders"]
     end
 
-    subgraph KeyBuild["Key Construction"]
-        EXTRACT[Extract rate-limit key from auth token]
-        LOOKUP[Lookup matching rule from local cache]
-        KEY[Build Redis key: rl:user:12345:orders_api]
+    subgraph ServiceNode["Rate Limiter Service Node"]
+        AUTH[Authenticate client API key]
+        LOOKUP[Lookup client's rules from cache]
+        KEY[Build Redis key: tenant:clientA:user:12345:orders]
     end
 
     subgraph RedisLua["Redis Lua Script - Atomic Execution"]
@@ -85,66 +75,68 @@ flowchart TB
         EXPIRE[Set TTL on key]
     end
 
-    subgraph Response["Response Path"]
-        ALLOW_HDR[Add headers: X-RateLimit-Remaining]
-        DENY_HDR[Add headers: Retry-After + 429 status]
-        FORWARD[Forward to backend service]
-        REJECT[Return 429 Too Many Requests]
+    subgraph Response["Response to Client"]
+        ALLOW_RESP["{allowed: true, remaining: 73, reset_at: ...}"]
+        DENY_RESP["{allowed: false, remaining: 0, retry_after: 12}"]
     end
 
-    subgraph Fallback["Fallback Path"]
+    subgraph InternalFallback["Internal Fallback"]
         REDIS_DOWN{Redis reachable?}
-        LOCAL[Use local token bucket with conservative limit]
-        ALERT[Emit alert: rate limiter in fallback mode]
+        LOCAL[Local conservative counter]
+        ALERT[Emit alert: degraded mode]
     end
 
-    REQ --> EXTRACT --> LOOKUP --> KEY
+    REQ --> AUTH --> LOOKUP --> KEY
     KEY --> REDIS_DOWN
     REDIS_DOWN -->|"yes"| HMGET
     REDIS_DOWN -->|"no"| LOCAL --> ALERT
 
     HMGET --> CALC_REFILL --> ADD_TOKENS --> CHECK
-    CHECK -->|"yes"| DEDUCT --> SAVE --> EXPIRE --> ALLOW_HDR --> FORWARD
-    CHECK -->|"no"| DENY --> SAVE --> EXPIRE --> DENY_HDR --> REJECT
+    CHECK -->|"yes"| DEDUCT --> SAVE --> EXPIRE --> ALLOW_RESP
+    CHECK -->|"no"| DENY --> SAVE --> EXPIRE --> DENY_RESP
 ```
 
-## 3. Critical Path Sequence: Rate-Limited API Request
+## 3. Client Integration Flow
 
 ```mermaid
 sequenceDiagram
-    participant Client as API Client
-    participant GW as API Gateway
-    participant RL as Rate Limit Evaluator
-    participant Cache as Local Rule Cache
+    participant EndUser as End User
+    participant Client as Client Service
+    participant SDK as Client SDK (optional)
+    participant RL as Rate Limiter Service
     participant Redis as Redis Cluster
-    participant SVC as Backend Service
 
-    Client->>GW: POST /api/orders (Authorization: Bearer token)
-    GW->>GW: Parse JWT, extract user_id=12345, tier=free
+    EndUser->>Client: GET /api/orders
 
-    GW->>RL: Check rate limit (key=user:12345, endpoint=/api/orders)
-    RL->>Cache: Lookup rules for tier=free, endpoint=/api/orders
-    Cache-->>RL: Rule: 100 req/min, token bucket, capacity=100, refill=1.67/sec
+    alt Using SDK
+        Client->>SDK: check("user:12345", "/api/orders")
+        SDK->>RL: POST /v1/check {key: "user:12345", endpoint: "/api/orders"}
+    else Direct API call
+        Client->>RL: POST /v1/check {key: "user:12345", endpoint: "/api/orders"}
+    end
 
-    RL->>Redis: EVALSHA token_bucket.lua rl:user:12345:orders [100, 1.67, now, 1]
-    Note over Redis: Atomic Lua execution: refill tokens, check, deduct
+    RL->>RL: Authenticate client, lookup rules
+    RL->>Redis: EVALSHA token_bucket.lua tenant:clientA:user:12345 [100, 1.67, now, 1]
+    Note over Redis: Atomic Lua: refill tokens, check, deduct
 
-    alt Allowed (tokens available)
-        Redis-->>RL: [1, 73] (allowed=true, remaining=73)
-        RL-->>GW: Allowed, remaining=73, reset=60s
-        GW->>SVC: Forward POST /api/orders
-        SVC-->>GW: 201 Created
-        GW-->>Client: 201 Created + X-RateLimit-Limit:100, X-RateLimit-Remaining:73, X-RateLimit-Reset:1700000060
-    else Denied (bucket empty)
-        Redis-->>RL: [0, 0] (allowed=false, remaining=0)
-        RL-->>GW: Denied, remaining=0, retry_after=12s
-        GW-->>Client: 429 Too Many Requests + Retry-After:12, X-RateLimit-Limit:100, X-RateLimit-Remaining:0
-    else Redis Unreachable
-        Redis-->>RL: Connection timeout
-        RL->>RL: Fallback to local token bucket (50 req/min conservative)
-        RL-->>GW: Allowed (local fallback), emit metric
-        GW->>SVC: Forward POST /api/orders
-        SVC-->>GW: 201 Created
-        GW-->>Client: 201 Created + rate limit headers from local state
+    alt Allowed
+        Redis-->>RL: [1, 73] (allowed, remaining)
+        RL-->>Client: {allowed: true, remaining: 73, reset_at: 1700000060}
+        Client->>Client: Add X-RateLimit headers to response
+        Client-->>EndUser: 200 OK + rate limit headers
+    else Denied
+        Redis-->>RL: [0, 0] (denied, remaining)
+        RL-->>Client: {allowed: false, remaining: 0, retry_after: 12}
+        Client-->>EndUser: 429 Too Many Requests + Retry-After: 12
+    else Rate Limiter Service Unreachable
+        RL-->>SDK: Connection timeout
+        Note over SDK: Apply client's configured failure policy
+        alt Client configured fail_mode: "deny"
+            SDK-->>Client: {allowed: false} (safe default)
+            Client-->>EndUser: 429 Too Many Requests
+        else Client configured fail_mode: "allow"
+            SDK-->>Client: {allowed: true} (best-effort)
+            Client-->>EndUser: 200 OK (rate limit temporarily unenforced)
+        end
     end
 ```

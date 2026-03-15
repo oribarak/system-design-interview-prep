@@ -12,15 +12,54 @@ Design a system to distribute a 500 GB ML model from S3 to 1,000 GPU nodes. The 
 
 **Non-functional:** 500 GB to 1,000 nodes in < 5 minutes. S3 egress = 1x model size (not 1,000x). Zero serving downtime. Bit-perfect integrity verification. Distribution must not degrade inference traffic.
 
-## 3. Why Naive Fails (show the math — this is the motivation)
+## 3. Distribution Strategy Comparison (the core of this question)
+
+**Key math**: External bandwidth is fixed (e.g., 10 Gbps shared). Downloading the first copy of 500 GB always takes 500 GB x 8 / 10 Gbps = **400 seconds**. The strategy only affects what happens after that.
+
+### Three strategies for 100 workers (10 Gbps external, 100 Gbps internal)
+
+| Strategy | How it works | Time | Why |
+|----------|-------------|------|-----|
+| **Sequential (naive)** | Every worker downloads from external. 10 Gbps / 100 = 0.1 Gbps each. | **~11 hours** | Bandwidth divided among all workers |
+| **Binary Tree** | Root downloads, distributes in tree. Pipelined. | **~13.5 min** | log2(100) = 7 levels of propagation |
+| **Pipeline (chain)** | W1->W2->W3->...->W100. Full-duplex: receive AND forward simultaneously. | **~7 min (408s)** | 400s download + 99 x 0.08s propagation |
+
+### Pipeline strategy (recommended for ~100 workers)
+
+```
+External Storage ---(10 Gbps)---> W1 ---> W2 ---> W3 ---> ... ---> W100
+                                  |       |       |                  |
+                               (receives AND forwards simultaneously, full-duplex)
+```
+
+- Split model into 1 GB chunks with SHA-256 checksum each.
+- W1 downloads chunk, immediately forwards to W2.
+- W2 forwards to W3 while receiving next chunk from W1.
+- Each chunk propagation: 1 GB / 12.5 GB/s = 0.08s per hop.
+- Total: 400s (download) + 99 hops x 0.08s = **408s (~7 min)**.
+
+### Scaling the pipeline
+
+| Workers | Download | Propagation | Total | Assessment |
+|---------|----------|-------------|-------|-----------|
+| 100 | 400s | 8s | **408s** | Excellent |
+| 1,000 | 400s | 80s | **480s** | Good |
+| 10,000 | 400s | 800s | **1,200s** | Propagation dominates |
+| 100,000 | 400s | 8,000s | **8,400s** | Need tree-of-pipelines |
+
+At 10,000+ workers, switch to **tree-of-pipelines**: organize workers into pipeline chains of ~100, connected in a tree structure.
+
+### Rack-aware ordering (minimize cross-rack hops)
+- Bad: W1(R1)->W4(R2)->W2(R1)->W5(R2) = 3 cross-rack hops
+- Good: W1(R1)->W2(R1)->W3(R1)->W4(R2)->W5(R2) = 1 cross-rack hop
+
+### Why naive fails (cost perspective with S3)
 
 | Approach | S3 Egress | Time | Cost per Deploy |
 |----------|----------|------|-----------------|
 | Every node pulls from S3 | 500 TB | 11 hours | $45,000 |
-| P2P (one download, internal spread) | 500 GB | ~40 seconds | $45 |
-| **Improvement** | **1,000x less** | **~1,000x faster** | **1,000x cheaper** |
-
-The cluster's internal network (100 Gbps per node) vastly exceeds S3 aggregate bandwidth. Use it.
+| P2P (one download, internal spread) | 500 GB | ~7 minutes | $45 |
+| **Improvement** | **1,000x less** | **~100x faster** | **1,000x cheaper** |
 
 ## 4. High-Level Architecture
 ```
@@ -77,9 +116,11 @@ Model is on NVMe. Now load to GPU and switch traffic:
 
 ## 7. Fault Tolerance
 
+- **Worker failure mid-pipeline**: Skip failed worker, reconnect predecessor to successor. E.g., W4->W5(failed)->W6 becomes W4->W6.
+- **Coordinator failure**: Active-standby with etcd leader election. All state persisted to etcd. Standby picks up within seconds.
 - **Seed failure**: Multiple seeds (2+). S3 download is resumable.
-- **Interior node failure**: Each node has a secondary parent from a different subtree. Switch in 5 seconds.
-- **Chunk corruption**: Per-chunk SHA-256 verification. Re-transfer from any node that has a valid copy.
+- **Interior node failure (tree)**: Each node has a secondary parent from a different subtree. Switch in 5 seconds.
+- **Chunk corruption**: Per-chunk SHA-256 verification. Retry with exponential backoff (max 3 attempts). Re-transfer from any node that has a valid copy.
 - **Deployment failure (>10% nodes fail)**: Halt and rollback automatically.
 
 ## 8. Key Trade-offs to Mention
@@ -92,8 +133,11 @@ Model is on NVMe. Now load to GPU and switch traffic:
 | Chunk size 1 GB vs. 64 MB | Larger = less overhead. Smaller = finer-grained pipelining and retry. |
 
 ## 9. Scaling
-- **10x (10K nodes)**: Multiple seeds, rack-level caching (1 copy per rack, intra-rack fan-out). Fan-out 16.
-- **100x (100K nodes, multi-DC)**: One seed per datacenter from S3, P2P within each DC. Incremental deltas (only changed weights, often <5% of total). Content-addressable deduplication across versions.
+- **~100 workers**: Pipeline chain is simplest and near-optimal.
+- **~1,000 workers**: Tree (fan-out 8) or pipeline both work. Tree has lower propagation tail.
+- **10K workers**: Tree-of-pipelines hybrid. Multiple seeds, rack-level caching. Fan-out 16.
+- **100K workers (multi-DC)**: One seed per datacenter from S3, P2P within each DC. Incremental deltas (only changed weights, often <5% of total). Content-addressable deduplication across versions.
+- **Alternative at scale**: Centrally Coordinated Mesh — a scheduler tracks which chunks each worker has and dynamically assigns transfers to maximize aggregate bandwidth.
 
 ## 10. Closing (30s)
-> Naive S3 distribution to 1,000 nodes: 11 hours, $45K. P2P tree with chunk pipelining: 40 seconds, $45. Download once to a seed, fan out at fan-out 8 through 3 tree levels. Pipelining means total time equals S3 download time plus negligible tree overhead. Models cached on NVMe for 5-second rollback. Zero-downtime via rolling TP-group-atomic switchover with canary verification at each wave.
+> The key insight: downloading the first copy is the bottleneck (400s at 10 Gbps). The distribution strategy only affects propagation after that. For ~100 workers, a simple pipeline chain (W1->W2->...->W100) with 1 GB chunked transfer adds only ~8s of propagation — total ~7 minutes. For 1,000+ workers, use a tree with fan-out 8 and chunk pipelining: total time equals download time plus negligible tree overhead (~40s at 100 Gbps external). At 10,000+ workers, use tree-of-pipelines. Chunks have SHA-256 checksums for integrity. Models cached on NVMe for 5-second rollback. Zero-downtime via rolling TP-group-atomic switchover with canary verification at each wave.

@@ -73,6 +73,57 @@ Async path:
 
 **The magic:** 10-50ms of invisible latency buys 24x fewer GPUs.
 
+## 6b. Response Routing -- WHERE MOST CANDIDATES FAIL
+
+**The problem**: User connects to API Server 1. Request gets batched and processed on a GPU Worker (different machine). GPU produces the result. **How does the result get back to API Server 1's parked HTTP connection?**
+
+**Solution: Per-instance Redis Pub/Sub channels**
+```
+1. Each API server subscribes to its own channel: SUBSCRIBE response:api-server-7
+2. Batch metadata includes: { request_id, api_instance_id: "api-server-7" }
+3. GPU processes batch, publishes result: PUBLISH response:api-server-7 { request_id, output }
+4. API Server 7 receives it, looks up parked HTTP connection by request_id, writes response
+```
+
+No broadcast waste. GPU workers don't know about HTTP connections -- they just publish to a channel name from the batch metadata.
+
+**Collocated vs. Separate batching -- this affects routing complexity:**
+
+| Architecture | Response routing | GPU efficiency | When to use |
+|---|---|---|---|
+| **Collocated** (batcher in each API server) | Simple -- batcher holds local connection refs | Lower -- each server batches independently | Low-medium scale |
+| **Separate** (dedicated batcher service) | Hard -- needs Redis Pub/Sub routing above | Higher -- global view of all requests | High scale |
+
+Start collocated. Move to separate only when per-node traffic < 100 QPS (batches too small).
+
+## 6c. Pull-Based GPU Assignment (BLPOP)
+
+GPUs **pull** work rather than having work pushed to them:
+```
+Accumulator:  LPUSH batch_queue:{model} batch
+GPU Worker:   BLPOP batch_queue:{model} timeout=1s  (blocking pop, loop)
+```
+Why: natural backpressure (busy GPU doesn't pop), race-free (BLPOP is atomic), self-balancing (fast GPUs pop more).
+
+## 6d. Capacity Estimation (concrete numbers to cite)
+```
+GPU processing:       ~100ms per batch of 32
+Throughput per GPU:   320 RPS  (32 x 10 batches/sec)
+For 10K QPS:          ~32 GPUs needed
+
+Latency breakdown:
+  Batch wait:    ~16ms  (half of fill time)
+  Network hops:  ~20ms  (API->Redis->GPU->Redis->API)
+  GPU processing: 100ms
+  Total:         ~136ms
+```
+
+## 6e. Auto-Scaling
+- Queue depth > 500 batches --> add 3 GPUs immediately
+- GPU cold start = 1-5 min (model loading) --> scale aggressively, keep 2-3 warm spares
+- GPU util < 30% for 15 min --> scale down 1 GPU
+- Pre-scale by time-of-day patterns
+
 ## 7. Async Batch Jobs
 
 1. Client submits 50K prompts via POST /v1/batches. Returns immediately with batch_id.
@@ -91,8 +142,17 @@ Cost optimization: schedule during off-peak, use spot GPUs, larger batch sizes (
 | Per-node vs. centralized accumulator | Per-node = no coordination cost. Centralized = bigger batches at low traffic. |
 | Economy capacity share | Too high = starves real-time. Too low = batch jobs miss SLA. Dynamic by time of day. |
 
-## 9. Scaling
-- **10x (100K QPS)**: Per-node accumulators (10K QPS/node fills batches in 3ms). Shard dispatcher by model.
+## 9. Bottleneck Analysis and Scaling
+
+**Bottlenecks at 10K QPS:**
+| Component | Capacity | At 10K QPS | Risk |
+|---|---|---|---|
+| GPU processing | 320 RPS/GPU (~32 GPUs) | Saturated if under-provisioned | HIGH |
+| API connections (C10K) | ~10K concurrent per server | ~1,360 concurrent (OK) | LOW |
+| Redis | ~100K ops/sec | ~10K ops/sec (10x headroom) | MEDIUM at 100K+ QPS |
+
+**Scaling:**
+- **10x (100K QPS)**: Per-node accumulators (10K QPS/node fills batches in 3ms). Shard dispatcher by model. Redis Cluster or per-model Redis instances.
 - **100x (1M QPS)**: Hierarchical batching (micro -> macro). Request deduplication by content hash (10-30% at scale). Dedicated GPU pools per tier.
 
 ## 10. Closing (30s)

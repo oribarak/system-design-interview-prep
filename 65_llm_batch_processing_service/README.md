@@ -336,6 +336,177 @@ Batch jobs are price-insensitive (24h SLA). Optimizations:
 3. **Lower quantization**: Use INT4 quantized models for economy tier if acceptable quality.
 4. **Larger batch sizes**: Economy can wait 500ms+ for a full batch, maximizing throughput per GPU-second.
 
+## 8b) Deep Dive #3: Response Routing — Getting Results Back to the Right Caller (THIS IS WHERE MOST CANDIDATES FAIL)
+
+### The problem most people miss
+
+The user connects to **API Server 1** and their HTTP connection is parked there. The request gets batched and sent to a **GPU Worker** (a completely different process, possibly on a different machine). The GPU produces the result and publishes it. **How does the result find its way back to API Server 1's specific parked HTTP connection?**
+
+This is a distributed fan-out/fan-in problem. In a single-process system it's trivial (the accumulator holds a reference to the response writer). In a multi-node deployment, it requires explicit routing.
+
+### Solution: Per-instance Redis Pub/Sub channels
+
+```
+1. Each API server instance has a unique instance_id (e.g., "api-server-7").
+2. On startup, each API server subscribes to its own Redis Pub/Sub channel:
+     SUBSCRIBE response:{instance_id}
+     e.g., SUBSCRIBE response:api-server-7
+
+3. When a request enters the accumulator, the batch metadata includes:
+     { request_id: "req-abc", api_instance_id: "api-server-7" }
+
+4. GPU worker processes the batch, produces results.
+
+5. GPU worker publishes each result to the correct channel:
+     PUBLISH response:api-server-7  { request_id: "req-abc", output: "..." }
+
+6. API Server 7 receives the message on its subscription,
+   looks up the parked HTTP connection by request_id, and writes the response.
+```
+
+### Why this design works
+
+- **No broadcast**: Each result is published to exactly one channel (the originating API server). No wasted fan-out.
+- **Decoupled**: GPU workers don't need to know about HTTP connections. They just publish to a channel name embedded in the batch metadata.
+- **Scalable**: Adding more API servers just means more Pub/Sub channels. Redis handles thousands of channels efficiently.
+- **Failure handling**: If API Server 7 crashes, its parked connections are already dead (TCP reset). Results published to its channel are simply lost — the client will retry. On restart, it re-subscribes with its instance_id.
+
+### Alternative: Pull-based with Redis lists
+
+Instead of Pub/Sub, each API server polls a Redis list:
+
+```
+GPU worker:  LPUSH results:api-server-7  { request_id, output }
+API server:  BRPOP results:api-server-7  (blocking pop, timeout 100ms)
+```
+
+Trade-off: BRPOP has slightly higher latency than Pub/Sub but is more durable (messages persist in the list if the API server is temporarily disconnected). For streaming responses, Pub/Sub is preferred for lower latency.
+
+### Connection tracking on the API server
+
+Each API server maintains an in-memory map:
+
+```
+pending_connections: Map<request_id, HttpResponseWriter>
+
+on_request_arrive(req):
+  pending_connections.put(req.id, response_writer)
+  send_to_accumulator(req, api_instance_id=self.instance_id)
+
+on_pubsub_message(msg):
+  writer = pending_connections.remove(msg.request_id)
+  writer.write(msg.output)
+  writer.close()
+```
+
+### Collocated vs. Separate Batching Service
+
+This response routing problem gets simpler or harder depending on where the batcher lives:
+
+| Architecture | How it works | Response routing complexity | When to use |
+|---|---|---|---|
+| **Collocated** (batcher inside each API server) | Each API server accumulates its own requests, forms batches, sends to GPU, gets results back | Simpler — the batcher knows which local HTTP connections to unpark | Lower scale, simpler ops, fewer API servers |
+| **Separate** (dedicated batching service) | API servers forward requests to a central batcher, batcher forms globally optimal batches, sends to GPU | Harder — results must route back through the batcher to the right API server | Higher scale, better GPU utilization (global view of all requests) |
+
+**Collocated trade-off**: Each API server batches independently, so at low traffic each server sees fewer requests and forms smaller batches (worse GPU efficiency). At high traffic (1K+ QPS per server), this doesn't matter — each server fills batches quickly.
+
+**Separate trade-off**: A centralized batcher sees ALL requests globally, forming optimally full batches even at lower traffic. But it adds a network hop and the response routing problem described above.
+
+**Recommendation**: Start collocated. Move to separate batching service only when per-node traffic is too low to fill batches efficiently (< 100 QPS per API server).
+
+## 8c) Deep Dive #4: Pull-Based GPU Assignment and Auto-Scaling
+
+### Pull-based GPU dispatch (BLPOP pattern)
+
+Instead of a dispatcher pushing batches to GPU workers, GPUs **pull** work from a shared queue:
+
+```
+Batch Accumulator:
+  LPUSH batch_queue:{model}  serialized_batch
+
+GPU Worker (loop):
+  batch = BLPOP batch_queue:{model} timeout=1s   // blocking pop
+  if batch:
+    results = process(batch)
+    for each result:
+      PUBLISH response:{api_instance_id}  result
+```
+
+**Why pull-based is better than push-based:**
+- **Natural backpressure**: If a GPU is busy, it simply doesn't pop. No need for load tracking or back-off logic.
+- **Race-free**: BLPOP is atomic — two GPUs will never grab the same batch.
+- **Self-balancing**: Faster GPUs process more batches naturally (they pop more often).
+- **Simpler failure handling**: If a GPU crashes mid-batch, the batch is already removed from the queue. Use a separate "in-flight" tracking set with timeout to detect and re-queue abandoned batches.
+
+### Capacity estimation (concrete numbers)
+
+```
+GPU processing time:    ~100ms per batch (prefill + first token for batch of 32)
+Batches per GPU per sec: 10
+Batch size:             32 requests
+Throughput per GPU:     32 x 10 = 320 RPS
+
+For 10K QPS: 10,000 / 320 = ~32 GPUs needed
+
+Latency breakdown for a single synchronous request:
+  Batch accumulation wait:  ~16ms average (half of 32ms to fill at 1K QPS/server)
+  Network (API -> Redis -> GPU): ~10ms
+  GPU processing:              ~100ms
+  Network (GPU -> Redis -> API): ~10ms
+  Total:                       ~136ms end-to-end
+```
+
+### Auto-scaling policy
+
+```
+Scale-up triggers:
+  - Queue depth (batch_queue:{model}) > 500 batches → add 3 GPUs immediately
+  - p99 batch wait time > 200ms for 2 minutes → add 2 GPUs
+  - GPU utilization > 90% sustained for 5 minutes → add 2 GPUs
+
+Scale-down triggers:
+  - GPU utilization < 30% for 15 minutes → remove 1 GPU
+  - Queue depth = 0 for 10 minutes → remove 1 GPU
+
+GPU cold start reality:
+  - Container/VM spin-up: 30-60 seconds
+  - Model weight loading: 1-5 minutes (depends on model size)
+  - Total cold start: 1-5 minutes
+
+Implications:
+  - Scale-up must be AGGRESSIVE — by the time a GPU is ready, traffic may have grown more
+  - Keep warm pool: maintain 2-3 idle GPUs pre-loaded with popular models
+  - Pre-scale based on time-of-day patterns (ramp up at 8 AM, down at 10 PM)
+```
+
+## 8d) Deep Dive #5: Bottleneck Analysis
+
+### Identifying the bottlenecks at 10K QPS
+
+| Component | Bottleneck | Capacity | At 10K QPS | Risk Level |
+|---|---|---|---|---|
+| GPU processing | Irreducible — this is the actual work | 320 RPS/GPU, need ~32 GPUs | Saturated if under-provisioned | HIGH |
+| API server connections | C10K problem — each parked connection holds a socket | ~10K concurrent connections per server (with async I/O) | 10K QPS with 136ms latency = ~1,360 concurrent connections | LOW |
+| Redis Pub/Sub | Message throughput | ~100K msgs/sec single instance | 10K responses/sec + 10K batch ops = ~30K ops/sec | MEDIUM |
+| Batch Accumulator | CPU for grouping/flushing | Millions of ops/sec (in-memory) | 10K inserts/sec | LOW |
+| Network bandwidth | Prompt/response payload | 10 Gbps NIC | At 20KB avg payload, 10K QPS = 200 MB/s = 1.6 Gbps | LOW |
+
+### C10K connection management
+
+At 10K QPS with ~136ms average request lifetime, there are ~1,360 concurrent parked HTTP connections. This is well within modern async server capabilities (epoll/kqueue handle millions). But at 100K QPS with longer-running requests, this can reach 10K-50K concurrent connections per server, requiring:
+- Async I/O frameworks (Tokio, asyncio, Netty)
+- Connection pooling
+- Horizontal scaling of API servers
+
+### Redis as a bottleneck
+
+At 10K QPS, Redis handles approximately:
+- 10K LPUSH (batches to queue): ~312 ops/sec (10K/32 batch size)
+- 10K PUBLISH (results back): 10K ops/sec
+- Total: ~10.3K ops/sec
+
+Redis single-instance handles ~100K ops/sec, so we have ~10x headroom. At 100K QPS, consider Redis Cluster or separate Redis instances per model.
+
 ## 9) Trade-offs and Alternatives (3-5 min)
 
 | Decision | Option A | Option B | Our Choice |

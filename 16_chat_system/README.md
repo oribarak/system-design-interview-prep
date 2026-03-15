@@ -197,7 +197,19 @@ GET /v1/conversations    (list user's conversations with last message)
 - **Kafka**: event bus for analytics, push notification triggers, multi-device sync
 - **Redis Cluster**: sessions, presence, typing, unread counts, sequence counters
 
-**One-sentence summary**: A stateful WebSocket architecture with Chat Servers handling persistent connections, Cassandra for message persistence with per-conversation sequence ordering, and Redis for session routing and real-time state management.
+### Routing: How Does WS1 Find WS2?
+
+With dozens (or thousands) of WebSocket servers, when a sender's Chat Server (WS1) needs to deliver a message to a recipient on a different Chat Server (WS2), the routing problem must be solved:
+
+**Option A — Session Registry lookup (chosen for baseline):** Redis stores `session:{user_id} -> {server_id, device_id}`. WS1 looks up the recipient's server and routes directly. Simple, but requires maintaining accurate session state.
+
+**Option B — Redis Pub/Sub (preferred for simplicity at scale):** Each Chat Server subscribes to channels for its connected users: `user:{user_id}`. When WS1 needs to deliver a message, it publishes to `user:{recipient_id}`. The Chat Server with that user's connection receives the message and delivers it via WebSocket. This eliminates the need for a separate Session Registry lookup on the send path — the Pub/Sub subscription implicitly handles routing. The Session Registry is still useful for checking online status and for push notification decisions.
+
+### Canonical 1:1 Conversation ID
+
+For DMs, ensure a unique conversation per user pair by enforcing a canonical ordering: `participant_1 = MIN(user_a, user_b)`, `participant_2 = MAX(user_a, user_b)`. Create a unique index on `(participant_1, participant_2)`. This prevents duplicate conversations between the same two users regardless of who initiates.
+
+**One-sentence summary**: A stateful WebSocket architecture with Chat Servers handling persistent connections, Cassandra for message persistence with per-conversation sequence ordering, and Redis for session routing (via Pub/Sub or direct lookup) and real-time state management.
 
 ---
 
@@ -250,10 +262,25 @@ What if seq 4568 is persisted but seq 4567 is delayed?
 - Missing message is likely in-flight and will arrive shortly
 - After 5 seconds of gap: fetch via REST to fill the hole
 
-### Multi-Device Sync
-- Each device tracks the last sequence number it has received per conversation
-- On reconnection: device requests messages since its last known seq: `GET /messages?after_seq=4500`
-- This handles the "new device" case: sync all messages from seq=0 (with pagination)
+### Offline Delivery: Inbox + In-Flight Pattern
+
+When a recipient is offline, messages must be reliably queued and delivered when they come back online. The inbox/in-flight pattern guarantees at-least-once delivery without message loss:
+
+1. **Inbox**: When the recipient is offline, the message is written to the user's inbox (a per-user queue in Redis or Cassandra).
+2. **In-flight**: When the user reconnects, messages are moved from inbox to an in-flight set. They are delivered over WebSocket.
+3. **ACK**: The client acknowledges receipt of each message (or batch). On ACK, the message is removed from in-flight.
+4. **Reaper**: A background process scans the in-flight set for stale items (e.g., delivered > 60 seconds ago with no ACK). Stale items are moved back to inbox for redelivery.
+
+This mirrors the SQS visibility-timeout pattern: messages are never deleted until explicitly acknowledged, and a reaper handles the case where delivery succeeds but ACK is lost.
+
+### Multi-Device Delivery
+
+For users logged into multiple devices, each device needs independent delivery tracking:
+
+- **Per-device inbox**: Each device has its own delivery queue. When a message arrives for a user, it is fanned out to all of that user's device inboxes.
+- **Per-device delivery status**: Each device independently ACKs messages. A message is considered "delivered" to a user only when all active devices have ACKed.
+- **Device sync on reconnect**: Each device tracks its own `last_received_seq` per conversation. On reconnection, it requests messages since its last known seq: `GET /messages?after_seq=4500`.
+- This handles the "new device" case: sync all messages from seq=0 (with pagination).
 
 ---
 
@@ -277,6 +304,16 @@ Instead of routing N individual messages to N Chat Servers:
 2. Send one message per Gateway Server with the list of recipient user_ids
 3. Each Gateway Server locally delivers to its connected users
 4. Reduces network calls from O(members) to O(gateway_servers)
+
+### Read Receipts: High-Water Mark Pattern
+
+Rather than tracking read status per-message (which explodes storage), use a **high-water mark** approach:
+
+- Store `last_read_sequence_number` per user per conversation (already in `conversation_members.last_read_seq`).
+- All messages with `seq <= last_read_seq` are considered read. No per-message read tracking needed.
+- When the client scrolls through messages, it sends a `read` event: `{ "type": "read", "conv_id": "c123", "up_to_seq": 1234 }`.
+- **Client-side debounce (2 seconds)**: As the user scrolls through many unread messages, don't send a `read` event for every message. Wait 2 seconds after the user stops scrolling, then send a single `read` event with the highest visible sequence number. This dramatically reduces write traffic.
+- Unread count = `conversation.last_message_seq - member.last_read_seq`.
 
 ### Delivery Receipt in Groups
 - Tracking per-member delivery/read status for 500 members per message is expensive
@@ -327,7 +364,7 @@ Cassandra is ideal for the append-only, partition-key-based message access patte
 | Connection overhead | 1 per user | 1 per user | New conn each poll |
 | Best for | Real-time chat | Notifications | Simple clients |
 
-WebSocket is the clear choice for a chat system requiring bidirectional real-time communication.
+WebSocket is the clear choice for a chat system: both parties need to push data (sender pushes messages, server pushes incoming messages, typing indicators, presence updates). SSE is server-to-client only, so the client would still need a separate channel to send messages. HTTP polling adds latency and connection overhead.
 
 ### Push vs Pull for Offline Messages
 - **Push on connect** (chosen): when a user connects, the server pushes all pending messages. Simple, fast delivery.

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36" version="29.6.1">
+  <diagram name="Page-1" id="-q5rB1mFx2HQWkoBUbfd">
+    <mxGraphModel dx="2276" dy="766" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="yEVexKfB1VVprKKpYjTD-5" edge="1" parent="1" source="yEVexKfB1VVprKKpYjTD-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="yEVexKfB1VVprKKpYjTD-4" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-1" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Client" vertex="1">
+          <mxGeometry height="60" width="120" x="-60" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-3" parent="1" style="text;html=1;whiteSpace=wrap;overflow=hidden;rounded=0;" value="&lt;h1 style=&quot;margin-top: 0px;&quot;&gt;Flow&lt;/h1&gt;&lt;p&gt;1. user using the client app to initiate a request&lt;/p&gt;&lt;p&gt;2. Client sending api request with the prompt, system instructions, auth token, model name&lt;/p&gt;&lt;p&gt;3. This goes throw a load balancer into one of our api gateway services - this will handle auth, rate limits&lt;/p&gt;&lt;p&gt;4. Request router will handle the tier and prioritization and will enqueue the prompt tho the right Q for prioritization&lt;/p&gt;&lt;p&gt;5. Scheduler/Orchestrator - Pick requests from Q, assign to gpu worker with available capacity&lt;/p&gt;&lt;p&gt;5. GPU workers&amp;nbsp; - running the inference engines push responses to response Qs&lt;/p&gt;&lt;p&gt;6. Publisher handling ws with clients, has some mapping of the request ID socket and get the right stored connection and stream response back&lt;/p&gt;" vertex="1">
+          <mxGeometry height="340" width="729" x="-40" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-7" edge="1" parent="1" source="yEVexKfB1VVprKKpYjTD-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="yEVexKfB1VVprKKpYjTD-6" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-4" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="api gateway" vertex="1">
+          <mxGeometry height="60" width="120" x="90" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-9" edge="1" parent="1" source="yEVexKfB1VVprKKpYjTD-6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="yEVexKfB1VVprKKpYjTD-12" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="580" y="430" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-6" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="scheduler" vertex="1">
+          <mxGeometry height="60" width="120" x="465" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-13" edge="1" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="yEVexKfB1VVprKKpYjTD-12" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="700" y="430" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-15" edge="1" parent="1" source="yEVexKfB1VVprKKpYjTD-12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="yEVexKfB1VVprKKpYjTD-14" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="680" y="530" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-12" parent="1" style="whiteSpace=wrap;html=1;rounded=0;" value="GPUs workers" vertex="1">
+          <mxGeometry height="60" width="120" x="720" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-17" edge="1" parent="1" source="yEVexKfB1VVprKKpYjTD-14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="yEVexKfB1VVprKKpYjTD-16" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-14" parent="1" style="whiteSpace=wrap;html=1;rounded=0;" value="Response Qs" vertex="1">
+          <mxGeometry height="60" width="120" x="620" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-18" edge="1" parent="1" source="yEVexKfB1VVprKKpYjTD-16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" target="yEVexKfB1VVprKKpYjTD-1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-16" parent="1" style="whiteSpace=wrap;html=1;rounded=0;" value="Publisher" vertex="1">
+          <mxGeometry height="60" width="120" x="420" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="yEVexKfB1VVprKKpYjTD-25" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="request router" vertex="1">
+          <mxGeometry height="60" width="120" x="255" y="400" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

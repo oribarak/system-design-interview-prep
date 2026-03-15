@@ -5,19 +5,30 @@ This is the whiteboard-friendly version. Use this in a 45-minute interview where
 ---
 
 ## 1. Problem Statement (30s)
-We need to design a system that serves LLM inference at scale -- 100M requests per day across multiple model sizes (7B to 405B parameters). The hard parts are maximizing GPU utilization (which is naturally low due to the autoregressive decode bottleneck), managing the massive KV cache memory, and meeting strict latency SLAs for interactive streaming.
+We need to design an inference API that connects user requests to GPU-based language model inference. The fundamental challenge: LLM inference has two phases with opposite hardware needs — prefill is compute-bound, decode is memory-bandwidth-bound. We need to maximize GPU utilization while meeting latency SLAs for interactive streaming.
 
 ## 2. Requirements
-**Functional:** Accept prompt input and return generated text with streaming support. Serve multiple model sizes and LoRA adapters on shared infrastructure. Support context lengths up to 128K tokens. Provide a batch inference API for offline workloads. Per-tenant rate limits.
+**Functional:** Accept prompt input and return generated text with streaming support (SSE). Serve multiple model sizes. Support context lengths up to 128K+ tokens. Per-tenant rate limits and priority tiers.
 
-**Non-functional:** Time-to-first-token (TTFT) under 500ms p99 for interactive requests. Inter-token latency (ITL) under 50ms p99. 99.9% availability. GPU utilization above 70% average. Graceful degradation under overload.
+**Non-functional:** Time-to-first-token (TTFT) under 500ms p99. Inter-token latency (ITL) under 50ms p99. 99.9% availability. GPU utilization above 70%. Graceful degradation under overload.
 
-## 3. Core Concept: Continuous Batching with Paged KV Cache
-Traditional static batching wastes GPU cycles because shorter sequences finish early while the GPU waits for the longest. Continuous batching admits and evicts sequences at every decode step, keeping the GPU busy. The KV cache -- which dominates memory -- is managed like virtual memory: fixed-size blocks are allocated on demand (PagedAttention), so sequences only consume what they need. When memory is exhausted, low-priority sequences are preempted by swapping their KV blocks to CPU memory. Together, these techniques increase GPU utilization from ~30% to ~70-80%.
+## 3. Why LLM Inference Is Hard (explain this first — shows real understanding)
+
+LLM inference has two phases:
+
+| | Prefill | Decode |
+|--|---------|--------|
+| What happens | Process all input tokens in parallel | Generate tokens one at a time |
+| Bottleneck | **Compute** (tensor cores) | **Memory bandwidth** (reading weights + KV cache) |
+| Latency metric | TTFT (time to first token) | ITL (inter-token latency) |
+
+**Why this matters:** You can't optimize one GPU for both. Prefill wants large token batches to saturate compute. Decode reads the entire KV cache per step but only produces 1 token — tensor cores are mostly idle. This tension drives every design decision.
 
 ## 4. High-Level Architecture
 ```
-Client --> API Gateway --> Request Router (priority queue)
+Client --> API Gateway --> Request Router (priority queue per model)
+                                |
+                    Scheduler (KV-cache aware)
                                 |
                           GPU Worker Pool
                     (continuous batching engine)
@@ -26,37 +37,92 @@ Client --> API Gateway --> Request Router (priority queue)
                     +--------+--+--------+
                     |        |           |
               Model Registry  Autoscaler  Metrics/Logs
-              (S3 + NVMe)    (queue depth) (ClickHouse)
+              (S3 + NVMe)    (weighted    (ClickHouse)
+                              queue depth)
 ```
-- **Request Router**: Model-aware routing with priority queuing; interactive traffic preempts batch.
-- **GPU Workers**: Run inference engines (vLLM/TensorRT-LLM) with continuous batching and paged KV cache.
-- **Autoscaler**: Monitors queue depth and GPU utilization; scales worker pools per model.
-- **Model Registry**: Tracks model versions and LoRA adapters; weights cached on local NVMe.
+- **Request Router**: Model-aware routing with priority queuing. Interactive preempts batch.
+- **GPU Workers**: Run inference engines with continuous batching and paged KV cache.
+- **Autoscaler**: Scales based on weighted queue depth (see section 7).
 
-## 5. How a Request Gets Served
-1. Client sends a prompt to the API Gateway, which authenticates and rate-limits.
-2. Request Router looks up the model, selects a GPU pool, and enqueues with priority.
-3. Scheduler assigns the request to a worker with available KV cache slots.
-4. Worker runs prefill (processes all input tokens in parallel -- compute-bound).
-5. Worker enters decode loop (generates one token per step -- memory-bound), streaming tokens back.
-6. On each decode iteration, finished sequences are evicted and new ones admitted (continuous batching).
-7. Tokens stream back through the router and gateway to the client via Server-Sent Events.
+## 5. The Three Key Mechanisms (explain these well and you're 80% there)
 
-## 6. What Happens When Things Fail?
-- **GPU failure**: Health checks every 5 seconds detect the failure. In-progress requests are re-queued and KV cache is recomputed on a healthy worker.
-- **Overload**: Queue depth triggers escalating responses: first preempt batch requests, then route to smaller models, finally shed requests with 429 status.
-- **LoRA adapter not loaded**: Router detects missing adapter and routes to the least-loaded worker, which loads the adapter on-the-fly (under 1 second for ~100 MB of weights).
+### A. Continuous Batching
+**Problem:** Static batching waits for the slowest request. If one generates 500 tokens and 31 others generate 50, the GPU idles for 90% of the time.
 
-## 7. Scaling
-- **10x**: Add more data-parallel replicas. Regional routing to reduce cross-region latency. Prefix caching hit rate improves with more traffic.
-- **100x**: Disaggregate prefill and decode into separate GPU pools (prefill is compute-bound, decode is memory-bound). Multi-tier model routing where a classifier sends simple queries to 7B and complex ones to 70B.
+**Fix:** After every decode step, evict finished sequences and admit new ones from the waiting queue. GPU never idles. Utilization: 30% (static) -> 70-80% (continuous).
 
-## 8. Key Trade-offs to Mention
+### B. PagedAttention (KV Cache Management)
+**Problem:** KV cache dominates GPU memory. A 70B model at 128K context = ~40 GB KV cache per sequence. H100 has 80 GB total. Pre-allocating max context wastes memory since most requests use ~1K tokens.
+
+**Fix:** Treat KV cache like virtual memory. Allocate fixed-size blocks (16 tokens each) on demand. A block table maps logical positions to physical GPU memory. When memory is full, preempt low-priority sequences by swapping their KV blocks to CPU DRAM. Fits 2-4x more concurrent sequences.
+
+### C. Dynamic Batching (the interviewer's favorite)
+**Problem:** Requests have variable lengths. Batching a 50-token and a 5,000-token request together wastes GPU.
+
+**Fix:** Group requests by estimated total token count into buckets (0-256, 256-1K, 1K-4K, 4K+). Form batches from the same bucket.
+
+**Batching trigger:** 32 requests OR 40ms timeout (whichever first). Under high load, batches fill instantly; under low load, the timeout prevents indefinite holding.
+
+**Flush vs. hold — the core latency/throughput knob:**
+- Flush immediately if batch is full OR oldest request nears TTFT SLA deadline
+- Hold for more requests if batch is undersized AND no SLA pressure
+- Tune per priority tier: interactive flushes aggressively, batch holds longer
+
+## 6. How a Request Gets Served
+1. Client sends prompt. Gateway authenticates, rate-limits.
+2. Router enqueues request into **tier-specific queue** (enterprise / paid / free) in Redis.
+3. **GPU worker pulls** a batch from queues (enterprise first, then paid, then free) via BLPOP — pull-based for natural backpressure.
+4. **Prefill**: Worker processes all input tokens in parallel (compute-bound). Produces KV cache + first token.
+5. First token streams back to client via SSE (this is the TTFT).
+6. **Decode loop**: Each step generates 1 token. After each step, finished sequences leave, new ones join (continuous batching).
+7. Tokens stream back one at a time until EOS or max_tokens.
+8. On completion, KV cache blocks are freed, batch slot opens for the next request.
+
+**Important:** If the client disconnects mid-stream, the engine must detect this and cancel the request immediately — otherwise you waste GPU generating tokens nobody reads.
+
+### Response Routing (the hard part — "where most candidates fail")
+The GPU worker is NOT the process holding the client's HTTP connection. How do results get back?
+1. Gateway assigns `request_id`, stores `request_id -> gateway_instance + response_channel` in Redis. Keeps HTTP connection open with async I/O.
+2. GPU worker publishes result/tokens to Redis pub/sub keyed by `request_id`.
+3. Gateway subscribes to its channel, receives tokens, writes them to the correct pending HTTP connection.
+
+This decouples request path from response path — no sticky routing needed.
+
+## 7. Autoscaling Signal (key insight)
+Raw GPU utilization is **misleading** — it can look fine (70%) while latency is tanking because the queue is full of long-context requests.
+
+Raw queue depth is also misleading — 100 short requests != 100 long-context requests.
+
+**Better signal: `weighted_queue_depth = sum(estimated_tokens per queued request)`**
+
+This captures actual *work* waiting. Scale up when weighted queue depth exceeds a threshold relative to the pool's token processing capacity.
+
+## 8. Scaling
+- **10x**: Add more data-parallel replicas. Regional routing. Prefix caching (shared system prompts skip prefill — saves 30-60% of compute).
+- **100x**: **Disaggregate prefill and decode** into separate GPU pools. Prefill pool optimized for compute, decode pool optimized for memory bandwidth. KV cache transferred between them. Each pool scales independently with no interference.
+
+## 9. Key Operational Details (interviewers probe these)
+
+**Dynamic rate limiting:** Rate limiter adjusts based on GPU health + queue depth:
+- Normal: all tiers admitted
+- Warning (queue growing / GPUs failing): only enterprise + paid
+- Critical: only enterprise. Better to reject early than queue and timeout.
+
+**Timeouts (three layers):** queue_age 2s (drop stale requests), gpu_processing 3s, total_request 5s end-to-end.
+
+**Failure handling:** 1-2 retries on a **different GPU**, then dead-letter queue (DLQ). For streaming: at-most-once (no duplicate tokens).
+
+**Traffic spike timeline:** Queue absorbs (0-2s) -> autoscale triggers (2-30s) -> GPU provisioning (30s-5min) -> capacity restored. Must survive the provisioning gap with queues + rate limiting.
+
+## 10. Key Trade-offs
 | Decision | Trade-off |
 |---|---|
-| Continuous batching vs. static batching | 2-3x higher GPU utilization, but more complex scheduling and request management |
-| PagedAttention (on-demand KV blocks) | Eliminates wasted pre-allocation, but adds block-table management overhead and requires custom attention kernels |
-| FP8 quantization on H100 | ~2x throughput with minimal quality loss, but not all models tolerate quantization equally |
+| Continuous vs. static batching | 2-3x higher utilization, but complex scheduling |
+| PagedAttention | 2-4x more concurrent sequences, but needs custom attention kernels |
+| Flush vs. hold (dynamic batching) | Flush early = lower latency, hold longer = higher throughput |
+| GPU util vs. queue depth for autoscaling | GPU util is misleading. Weighted queue depth captures actual work. |
+| Disaggregated prefill/decode | Eliminates interference, but adds KV cache transfer latency (10-50ms) |
+| Push vs. pull GPU scheduling | Pull (BLPOP) gives natural backpressure, no central bottleneck |
 
-## 9. Closing (30s)
-> We designed an LLM inference system serving 100M+ requests/day around three pillars: continuous batching that admits and evicts sequences every decode step for 70%+ GPU utilization, paged KV cache management that allocates memory on demand and preempts low-priority requests, and a multi-level scheduler with priority-based routing and LoRA-aware placement. At 100x scale, we disaggregate prefill and decode onto specialized GPU pools and introduce intelligent model routing.
+## 11. Closing (30s)
+> The core challenge is that prefill is compute-bound and decode is memory-bandwidth-bound — you can't optimize one GPU for both. We address this with continuous batching (never idle), paged KV cache (memory on demand), and dynamic batching (group by length, flush vs. hold as the latency/throughput knob). Autoscaling uses queue depth weighted by estimated tokens, not raw GPU util. At 100x scale, we disaggregate prefill and decode onto separate GPU pools optimized for each phase.
